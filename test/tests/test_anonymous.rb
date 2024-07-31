@@ -198,7 +198,7 @@ class TestAnonymous < Test::Unit::TestCase
     end
   end
 
-  def test_that_recycling_a_parent_invalidates_an_anonymous_object
+  def test_that_recycling_a_parent_does_not_invalidate_an_anonymous_object
     run_test_as('programmer') do
       o = create(:nothing)
       add_verb(o, ['player', 'xd', 'go'], ['this', 'none', 'this'])
@@ -208,7 +208,7 @@ class TestAnonymous < Test::Unit::TestCase
         vc << %Q|recycle(o);|
         vc << %Q|return valid(a);|
       end
-      assert_equal 0, call(o, 'go')
+      assert_equal 1, call(o, 'go')
     end
   end
 
