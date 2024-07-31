@@ -20,6 +20,9 @@
  *****************************************************************************/
 
 #include <string.h>
+#include <unordered_map>
+#include <vector>
+#include <algorithm>
 
 #include <ctime>
 #include "config.h"
@@ -34,7 +37,6 @@
 #include "utils.h"
 #include "dependencies/xtrapbits.h"
 #include "map.h"
-#include <unordered_map>
 #include "options.h"
 #include "log.h"
 
@@ -42,12 +44,17 @@ static Object **objects;
 static Num num_objects = 0;
 static Num max_objects = 0;
 
-static unsigned int nonce = 0;
+/* Anonymous objects aren't tracked by the standard child mechanism.
+ * In order to update the propdefs, we need to know what anons descend
+ * from any given parent. Rather than cluttering children lists up with
+ * anons and messing with filtering functions like children(), we 
+ * just keep track of them here. */
+static std::unordered_map<Objid, std::vector<Object*>> anonymous_objects;
 
 static Var all_users;
 
 #ifdef USE_ANCESTOR_CACHE
-static std::unordered_map <int, Var> ancestor_cache;
+static std::unordered_map <Num, Var> ancestor_cache;
 #endif /* USE_ANCESTOR_CACHE */
 
 /* used in graph traversals */
@@ -135,31 +142,92 @@ ensure_new_object(void)
 }
 
 void
-dbpriv_assign_nonce(Object *o)
-{
-    o->nonce = nonce++;
-}
-
-void
 dbpriv_after_load(void)
 {
     int i;
 
     for (i = num_objects; i < max_objects; i++) {
         if (objects[i]) {
-            dbpriv_assign_nonce(objects[i]);
             objects[i] = nullptr;
         }
     }
+}
+
+void
+dbpriv_remove_anon(Objid parent, Object *obj)
+{
+    auto it = anonymous_objects.find(parent);
+    if (it != anonymous_objects.end()) {
+        auto& vec = it->second;
+        auto obj_it = std::find(vec.begin(), vec.end(), obj);
+        if (obj_it != vec.end()) {
+            vec.erase(obj_it);
+            if (vec.empty()) {
+                anonymous_objects.erase(it);
+            }
+        }
+    }
+}
+
+void
+dbpriv_add_anon(Objid parent, Object *obj)
+{
+    anonymous_objects[parent].push_back(obj);
+}
+
+/* Weird name, weird function. Since we can't access anonymous_objects from
+ * db_properties.cc, we need a way to append the anons to a LIST of ancestors.
+*/
+void
+dbpriv_append_anon_list(Objid root, Var *ret)
+{
+    if (anonymous_objects.find(root) != anonymous_objects.end()) {
+        Num size = ret->v.list[0].v.num;
+        Var new_var = new_list(size + anonymous_objects[root].size());
+        Num count;
+
+        for (count = 1; count <= size; count++)
+            new_var.v.list[count] = var_ref(ret->v.list[count]);
+
+        for (const auto& x : anonymous_objects[root]) {
+            new_var.v.list[count++] = var_ref(Var::new_anon(x));
+        }
+
+        free_var(*ret);
+
+#ifdef ENABLE_GC
+        if (new_var.v.list[0].v.num > 0)
+            gc_set_color(new_var.v.list, GC_YELLOW);
+#endif
+
+        *ret = new_var;
+    }
+}
+
+void
+dbpriv_destroy_anon_map()
+{
+    for (const auto& x : anonymous_objects) {
+        std::vector<Object*> vector = x.second;
+        for (const auto& y : vector) {
+            Var z = Var::new_anon(y);
+            free_var(z);
+        }
+        vector.clear();
+    }
+    anonymous_objects.clear();
 }
 
 /* Both `dbpriv_new_object()' and `dbpriv_new_anonymous_object()'
  * allocate space for an `Object' and put the object into the array of
  * Objects.  The difference is the storage type used.  `M_ANON'
  * includes space for reference counts.
+ * `dbpriv_new_object()' now also optionally allocates as `M_ANON',
+ * allowing bf_create() to function as normal but without an added
+ * memory copy at the end.
  */
 Object *
-dbpriv_new_object(Num new_objid)
+dbpriv_new_object(Num new_objid, bool anonymous)
 {
     Object *o;
 
@@ -169,8 +237,15 @@ dbpriv_new_object(Num new_objid)
         num_objects++;
     }
 
-    o = objects[new_objid] = (Object *)mymalloc(sizeof(Object), M_OBJECT);
+    Memory_Type mem_type;
+    if (anonymous)
+        mem_type = M_ANON;
+    else
+        mem_type = M_OBJECT;
+
+    o = objects[new_objid] = (Object *)mymalloc(sizeof(Object), mem_type);
     o->id = new_objid;
+
     o->waif_propdefs = nullptr;
 
     return o;
@@ -186,6 +261,8 @@ dbpriv_new_anonymous_object(void)
     o->id = NOTHING;
     num_objects++;
 
+    o->waif_propdefs = nullptr;
+
     return o;
 }
 
@@ -197,7 +274,7 @@ dbpriv_new_recycled_object(void)
 }
 
 void
-db_init_object(Object *o)
+db_init_object(Object *o, bool anonymous /* false */)
 {
     o->name = str_dup("");
     o->flags = 0;
@@ -206,7 +283,13 @@ db_init_object(Object *o)
     o->children = new_list(0);
 
     o->location = var_ref(nothing);
-    o->last_move = (clear_last_move ? var_ref(zero) : new_map());
+
+    if (anonymous) {
+        o->last_move = var_ref(zero);
+    } else {
+        o->last_move = (clear_last_move ? var_ref(zero) : new_map());
+    }
+        
     o->contents = new_list(0);
 
     o->propval = nullptr;
@@ -217,18 +300,19 @@ db_init_object(Object *o)
     o->propdefs.l = nullptr;
 
     o->verbdefs = nullptr;
+    o->waif_propdefs = nullptr;
 }
 
 Objid
-db_create_object(Num new_objid)
+db_create_object(Num new_objid, bool anonymous)
 {
     Object *o;
 
     if (new_objid <= 0 || new_objid > num_objects)
         new_objid = num_objects;
 
-    o = dbpriv_new_object(new_objid);
-    db_init_object(o);
+    o = dbpriv_new_object(new_objid, anonymous);
+    db_init_object(o, anonymous);
 
     return o->id;
 }
@@ -349,18 +433,6 @@ Object *
 db_make_anonymous(Objid oid, Objid last)
 {
     Object *o = objects[oid];
-    Var old_parents = o->parents;
-    Var me = Var::new_obj(oid);
-
-    Var parent;
-    int i, c;
-
-    /* remove me from my old parents' children */
-    if (old_parents.type == TYPE_OBJ && old_parents.v.obj != NOTHING)
-        objects[old_parents.v.obj]->children = setremove(objects[old_parents.v.obj]->children, me);
-    else if (old_parents.type == TYPE_LIST)
-        FOR_EACH(parent, old_parents, i, c)
-        objects[parent.v.obj]->children = setremove(objects[parent.v.obj]->children, me);
 
     objects[oid] = nullptr;
     db_set_last_used_objid(last);
@@ -372,14 +444,7 @@ db_make_anonymous(Objid oid, Objid last)
     free_var(o->last_move);
     free_var(o->contents);
 
-    /* Last step, reallocate the memory and copy -- anonymous objects
-     * require space for reference counting.
-     */
-    Object *t = (Object *)mymalloc(sizeof(Object), M_ANON);
-    memcpy(t, o, sizeof(Object));
-    myfree(o, M_OBJECT);
-
-    return t;
+    return o;
 }
 
 void
@@ -391,6 +456,15 @@ db_destroy_anonymous_object(void *obj)
 
     free_str(o->name);
     o->name = nullptr;
+
+    /* Update the anonymous object map. */
+    Var parent;
+    int ind, c;
+    if (o->parents.type == TYPE_OBJ && o->parents.v.obj != NOTHING)
+        dbpriv_remove_anon(o->parents.v.obj, o);
+    else if (o->parents.type == TYPE_LIST)
+        FOR_EACH(parent, o->parents, ind, c)
+        dbpriv_remove_anon(parent.v.obj, o);
 
     free_var(o->parents);
 
@@ -429,7 +503,7 @@ parents_ok(Object *o)
         int i, c;
         FOR_EACH(parent, o->parents, i, c) {
             Objid oid = parent.v.obj;
-            if (!valid(oid) || objects[oid]->nonce > o->nonce) {
+            if (!valid(oid)) {
                 dbpriv_set_object_flag(o, FLAG_INVALID);
                 return 0;
             }
@@ -437,7 +511,7 @@ parents_ok(Object *o)
     }
     else {
         Objid oid = o->parents.v.obj;
-        if (NOTHING != oid && (!valid(oid) || objects[oid]->nonce > o->nonce)) {
+        if (NOTHING != oid && !valid(oid)) {
             dbpriv_set_object_flag(o, FLAG_INVALID);
             return 0;
         }
@@ -597,7 +671,6 @@ db_object_bytes(Var obj)
 
     return count;
 }
-
 
 /* Traverse the tree/graph twice.  First to count the maximal number
  * of members, and then to copy the members.  Use the bit array to
@@ -857,19 +930,18 @@ db_object_children(Objid oid)
 }
 
 int
-db_count_children(Objid oid)
+db_next_child(Objid oid, Var *ret)
 {
-    return listlength(objects[oid]->children);
-}
+    if (objects[oid]->children.v.list[0].v.num > 0) {
+        *ret = objects[oid]->children.v.list[1];
+        return 1;
+    }
 
-int
-db_for_all_children(Objid oid, int (*func) (void *, Objid), void *data)
-{
-    int i, c = db_count_children(oid);
-
-    for (i = 1; i <= c; i++)
-        if (func(data, objects[oid]->children.v.list[i].v.obj))
-            return 1;
+    auto it = anonymous_objects.find(oid);
+    if (it != anonymous_objects.end() && !((it->second).empty())) {
+        *ret = Var::new_anon(it->second[0]);
+        return 1;
+    }
 
     return 0;
 }
@@ -915,9 +987,21 @@ db_change_parents(Var obj, Var new_parents, Var anon_kids)
 {
     if (!check_for_duplicates(new_parents))
         return 0;
-    if (!check_for_duplicates(anon_kids))
-        return 0;
-    if (!check_children_of_object(obj, anon_kids))
+
+    /* Gather a list of anonymous children. */
+    if (anon_kids.type != TYPE_LIST || anon_kids.v.list[0].v.num == 0)
+    {
+        if (anonymous_objects.find(obj.v.obj) != anonymous_objects.end()) {
+            anon_kids = new_list(anonymous_objects[obj.v.obj].size());
+            Num count = 1;
+            for (const auto& x : anonymous_objects[obj.v.obj]) {
+                Var v = Var::new_anon(x);
+                anon_kids.v.list[count++] = var_ref(v);
+            }
+        }
+    }
+
+    if (!check_children_of_object(obj, anon_kids))  
         return 0;
     if (!dbpriv_check_properties_for_chparent(obj, new_parents, anon_kids))
         return 0;
@@ -925,8 +1009,9 @@ db_change_parents(Var obj, Var new_parents, Var anon_kids)
     Object *o = dbpriv_dereference(obj);
 
     if (o->verbdefs == nullptr
-            && listlength(o->children) == 0
-            && (TYPE_LIST != anon_kids.type || listlength(anon_kids) == 0)) {
+            && listlength(o->children) == 0) {
+//            && (TYPE_LIST != anon_kids.type || listlength(anon_kids) == 0)) {
+        // (anonymous objects can't currently have verbs, so this should be fine to skip)
         /* Since this object has no children and no verbs, we know that it
            can't have had any part in affecting verb lookup, since we use first
            parent with verbs as a key in the verb lookup cache. */
@@ -943,12 +1028,11 @@ db_change_parents(Var obj, Var new_parents, Var anon_kids)
 
     /* save this; we need it later */
     Var old_ancestors = db_ancestors(obj, true);
+    Var parent;
+    int i, c;
 
     /* only adjust the parent's children for permanent objects */
     if (TYPE_OBJ == obj.type) {
-        Var parent;
-        int i, c;
-
         /* remove me/obj from my old parents' children */
         if (old_parents.type == TYPE_OBJ && old_parents.v.obj != NOTHING)
             objects[old_parents.v.obj]->children = setremove(objects[old_parents.v.obj]->children, obj);
@@ -962,32 +1046,38 @@ db_change_parents(Var obj, Var new_parents, Var anon_kids)
         else if (new_parents.type == TYPE_LIST)
             FOR_EACH(parent, new_parents, i, c)
             objects[parent.v.obj]->children = setadd(objects[parent.v.obj]->children, obj);
+    } else if (obj.type == TYPE_ANON) {
+        /* Update the anonymous object map. */
+        if (old_parents.type == TYPE_OBJ && old_parents.v.obj != NOTHING)
+            dbpriv_remove_anon(old_parents.v.obj, obj.v.anon);
+        else if (old_parents.type == TYPE_LIST)
+            FOR_EACH(parent, old_parents, i, c)
+            dbpriv_remove_anon(parent.v.obj, obj.v.anon);
+
+        if (new_parents.type == TYPE_OBJ && new_parents.v.obj != NOTHING)
+            dbpriv_add_anon(new_parents.v.obj, obj.v.anon);
+        else if (new_parents.type == TYPE_LIST)
+            FOR_EACH(parent, new_parents, i, c)
+            dbpriv_add_anon(parent.v.obj, obj.v.anon);
     }
 
     free_var(o->parents);
     o->parents = var_dup(new_parents);
 
-    /* Nothing between this point and the completion of
-     * `dbpriv_fix_properties_after_chparent' may call `anon_valid'
-     * because `o' is currently invalid (the nonce is out of date and
-     * the aforementioned call will fix that).
-     */
-
 #ifdef USE_ANCESTOR_CACHE
     /* Invalidate the cache for all descendants of the object that is changing parents. */
+    if (obj.type == TYPE_OBJ) {
     Var desc;
-    int i, c;
 
     Var descendants = db_descendants(obj, true);
     FOR_EACH(desc, descendants, i, c) {
         if (ancestor_cache.count(desc.v.obj) > 0) {
-            if (var_refcount(ancestor_cache[desc.v.obj]) > 1)
-                applog(LOG_ERROR, "Refcount too high for ancestor cache invalidation of #%i. Refcount = %i\n", desc.v.obj, var_refcount(ancestor_cache[desc.v.obj]));
             free_var(ancestor_cache[desc.v.obj]);
             ancestor_cache.erase(desc.v.obj);
         }
     }
     free_var(descendants);
+    }
 #endif /* USE_ANCESTOR_CACHE */
 
     Var new_ancestors = db_ancestors(obj, true);
@@ -1191,15 +1281,12 @@ db_object_isa(Var object, Var parent)
     return 0;
 }
 
-void
-db_fixup_owners(const Objid obj)
+void do_fixup_owners(Object *o, const Objid obj)
 {
-    for (Objid oid = 0; oid < num_objects; oid++) {
-        Object *o = objects[oid];
-        Pval *p;
+    Pval *p;
 
         if (!o)
-            continue;
+            return;
 
         if (o->owner == obj)
             o->owner = NOTHING;
@@ -1212,7 +1299,17 @@ db_fixup_owners(const Objid obj)
         for (int i = 0, count = o->nval; i < count; i++)
             if (p[i].owner == obj)
                 p[i].owner = NOTHING;
-    }
+}
+
+void
+db_fixup_owners(const Objid obj)
+{
+    for (Objid oid = 0; oid < num_objects; oid++)
+        do_fixup_owners(objects[oid], obj);
+
+    for (const auto& x : anonymous_objects)
+        for (const auto& y : x.second)
+            do_fixup_owners(y, obj);
 }
 
 void
@@ -1224,3 +1321,49 @@ db_clear_ancestor_cache(void)
     ancestor_cache.clear();
 #endif
 }
+
+
+#ifndef NDEBUG
+Var
+db_anon_debug(Var options, Var arguments)
+{
+    // Optimistically assume the options are all valid
+    Var ret = new_list(options.v.list[0].v.num);
+
+    for (int x = 1; x <= options.v.list[0].v.num; x++) {
+        const char *option = options.v.list[x].v.str;
+        if (strcmp(option, "total_parents") == 0) {
+            ret.v.list[x] = Var::new_int(anonymous_objects.size());
+        } else if (strcmp(option, "parents") == 0) {
+            ret.v.list[x] = new_list(anonymous_objects.size());
+            Num count = 1;
+            for (const auto& y : anonymous_objects) {
+                ret.v.list[x].v.list[count++] = Var::new_int(y.first);
+            }
+                
+        } else if (strcmp(option, "children") == 0) {
+            if (arguments.type != TYPE_OBJ || anonymous_objects.find(arguments.v.obj) == anonymous_objects.end()) {
+                ret.v.list[x].type = TYPE_ERR;
+                ret.v.list[x].v.err = E_INVARG;
+            } else {
+                ret.v.list[x] = new_list(anonymous_objects[arguments.v.obj].size());
+                Num count = 1;
+                for (const auto& y : anonymous_objects[arguments.v.obj]) {
+                    ret.v.list[x].v.list[count++] = Var::new_anon(y);
+                }
+            }
+        } else if (strcmp(option, "total_children") == 0) {
+            if (arguments.type != TYPE_OBJ || anonymous_objects.find(arguments.v.obj) == anonymous_objects.end()) {
+                ret.v.list[x].type = TYPE_ERR;
+                ret.v.list[x].v.err = E_INVARG;
+            } else {
+                ret.v.list[x] = Var::new_int(anonymous_objects[arguments.v.obj].size());
+            }
+        } else {
+            ret.v.list[x] = Var::new_int(0);
+        }
+    }
+
+    return ret;
+}
+#endif

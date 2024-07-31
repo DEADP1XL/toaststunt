@@ -30,6 +30,7 @@
 #include "storage.h"
 #include "utils.h"
 #include "waif.h"
+#include "log.h"
 
 Propdef
 dbpriv_new_propdef(const char *name)
@@ -113,7 +114,11 @@ property_defined_at_or_below(const char *pname, int phash, Object *o)
 static void
 insert_prop2(Var obj, int pos, Pval pval)
 {
-    Object *o = dbpriv_dereference(obj);
+    Object *o;
+    if (obj.type == TYPE_ANON)
+        o = obj.v.anon;
+    else
+        o = dbpriv_dereference(obj);
     Pval *new_propval;
     int i, nprops;
 
@@ -122,8 +127,6 @@ insert_prop2(Var obj, int pos, Pval pval)
 
     free_waif_propdefs((WaifPropdefs*)o->waif_propdefs);
     o->waif_propdefs = nullptr;
-
-    dbpriv_assign_nonce(o);
 
     for (i = 0; i < pos; i++)
         new_propval[i] = o->propval[i];
@@ -157,6 +160,9 @@ insert_prop_recursively(Objid root, int prop_pos, Pval pv)
 
     Var descendant, descendants = db_descendants(Var::new_obj(root), false);
     int i, c, offset = 0;
+
+    dbpriv_append_anon_list(root, &descendants);
+
     int offsets[listlength(descendants)];
 
     FOR_EACH(descendant, descendants, i, c) {
@@ -166,7 +172,10 @@ insert_prop_recursively(Objid root, int prop_pos, Pval pv)
 
     FOR_EACH(descendant, descendants, i, c) {
         offset = offsets[i - 1];
-        insert_prop(descendant.v.obj, offset + prop_pos, pv);
+        if (descendant.type == TYPE_ANON)
+            insert_prop2(descendant, offset + prop_pos, pv);
+        else
+            insert_prop(descendant.v.obj, offset + prop_pos, pv);
     }
 
     free_var(descendants);
@@ -276,8 +285,6 @@ remove_prop2(Var obj, int pos)
 
     nprops = --o->nval;
 
-    dbpriv_assign_nonce(o);
-
     free_waif_propdefs((WaifPropdefs *)o->waif_propdefs);
     o->waif_propdefs = nullptr;
 
@@ -310,6 +317,9 @@ remove_prop_recursively(Objid root, int prop_pos)
 
     Var descendant, descendants = db_descendants(Var::new_obj(root), false);
     int i, c, offset = 0;
+
+    dbpriv_append_anon_list(root, &descendants);
+
     int offsets[listlength(descendants)];
 
     FOR_EACH(descendant, descendants, i, c) {
@@ -319,7 +329,10 @@ remove_prop_recursively(Objid root, int prop_pos)
 
     FOR_EACH(descendant, descendants, i, c) {
         offset = offsets[i - 1];
-        remove_prop(descendant.v.obj, offset + prop_pos);
+        if (descendant.type == TYPE_ANON)
+            remove_prop2(descendant, offset + prop_pos);
+        else
+            remove_prop(descendant.v.obj, offset + prop_pos);
     }
 
     free_var(descendants);
@@ -967,8 +980,6 @@ dbpriv_fix_properties_after_chparent(Var obj, Var old_ancestors, Var new_ancesto
     }
     me->propval = new_propval;
     me->nval = new_count;
-
-    dbpriv_assign_nonce(me);
 
     myfree(old_offsets, M_INT);
     myfree(new_offsets, M_INT);
