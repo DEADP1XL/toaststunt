@@ -1349,7 +1349,7 @@ db_anon_debug(Var options, Var arguments)
                 ret.v.list[x] = new_list(anonymous_objects[arguments.v.obj].size());
                 Num count = 1;
                 for (const auto& y : anonymous_objects[arguments.v.obj]) {
-                    ret.v.list[x].v.list[count++] = Var::new_anon(y);
+                    ret.v.list[x].v.list[count++] = var_ref(Var::new_anon(y));
                 }
             }
         } else if (strcmp(option, "total_children") == 0) {
@@ -1357,7 +1357,7 @@ db_anon_debug(Var options, Var arguments)
                 ret.v.list[x].type = TYPE_ERR;
                 ret.v.list[x].v.err = E_INVARG;
             } else {
-                ret.v.list[x] = Var::new_int(anonymous_objects[arguments.v.obj].size());
+                ret.v.list[x] = var_ref(Var::new_int(anonymous_objects[arguments.v.obj].size()));
             }
         } else {
             ret.v.list[x] = Var::new_int(0);
